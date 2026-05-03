@@ -3,7 +3,6 @@ import uuid
 import threading
 import zipfile
 import queue
-import time
 import json
 from flask import Flask, request, jsonify, Response, send_file, render_template_string
 from flask_cors import CORS
@@ -12,16 +11,15 @@ import downloader
 app = Flask(__name__)
 CORS(app)
 
-# In-memory job store: {job_id: {status, log_queue, files, config}}
 jobs = {}
 jobs_lock = threading.Lock()
 
 WORK_DIR = "/tmp/yct_jobs"
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# ─── HTML FRONTEND ──────────────────────────────────────────────────────────
+# ─── HTML FRONTEND ────────────────────────────────────────────────────────────
 
-HTML = """<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -35,7 +33,7 @@ HTML = """<!DOCTYPE html>
   .sub{color:#4a4a6a;font-size:14px;margin-top:6px}
   .badge{display:inline-block;background:#6c63ff22;border:1px solid #6c63ff44;border-radius:24px;padding:3px 14px;font-size:11px;color:#9d97ff;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}
   .header{text-align:center;margin-bottom:32px}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:900px;margin:0 auto}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:940px;margin:0 auto}
   @media(max-width:700px){.grid{grid-template-columns:1fr}}
   .card{background:#0d0d1a;border:1px solid #1e1e38;border-radius:14px;padding:24px}
   .section-label{font-size:11px;color:#4a4a6a;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;margin-top:18px}
@@ -57,14 +55,14 @@ HTML = """<!DOCTYPE html>
   .step-icon{font-family:monospace;font-size:18px;min-width:24px}
   .step-name{font-size:14px;font-weight:600}
   .step-detail{font-size:12px;color:#7878a8;margin-top:2px}
-  .step-status{margin-left:auto;font-size:11px;text-transform:uppercase;font-family:monospace;letter-spacing:1px}
+  .step-status{margin-left:auto;font-size:11px;text-transform:uppercase;font-family:monospace;letter-spacing:1px;white-space:nowrap;padding-left:8px}
   .log-box{background:#070710;border:1px solid #1e1e38;border-radius:8px;padding:12px;height:180px;overflow-y:auto;font-family:'DM Mono',monospace;font-size:12px;color:#7878a8;margin-top:12px}
   .progress-bar-bg{background:#1e1e38;border-radius:4px;height:6px;overflow:hidden;margin-top:6px}
   .progress-bar-fill{height:100%;background:linear-gradient(90deg,#6c63ff,#f0a500);border-radius:4px;transition:width .3s}
   .progress-label{display:flex;justify-content:space-between;margin-top:10px;margin-bottom:4px;font-size:12px}
   .downloads{background:#0d1a0d;border:1px solid #22c55e44;border-radius:10px;padding:16px;margin-top:12px;display:none}
   .downloads h3{color:#22c55e;font-size:14px;margin-bottom:10px}
-  .dl-btn{display:inline-block;padding:8px 16px;border-radius:7px;background:#6c63ff22;border:1px solid #6c63ff44;color:#9d97ff;font-size:13px;text-decoration:none;margin-right:8px;margin-bottom:8px;cursor:pointer;font-family:'DM Sans',sans-serif}
+  .dl-btn{display:inline-block;padding:8px 16px;border-radius:7px;background:#6c63ff22;border:1px solid #6c63ff44;color:#9d97ff;font-size:13px;text-decoration:none;margin-right:8px;margin-bottom:8px;cursor:pointer}
   .dl-btn:hover{background:#6c63ff44}
   .panel-label{font-size:11px;color:#6c63ff;letter-spacing:2px;text-transform:uppercase;margin-bottom:20px;font-weight:600}
 </style>
@@ -77,7 +75,6 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <div class="grid">
-  <!-- CONFIG -->
   <div class="card">
     <div class="panel-label">⚙ Configuration</div>
 
@@ -103,24 +100,21 @@ HTML = """<!DOCTYPE html>
 
     <div class="divider"></div>
     <div class="section-label">Output</div>
-    <div class="toggle-row"><span>Generate PDF</span><button class="toggle" id="tgl-pdf" onclick="toggle('pdf')"><div class="knob" id="knob-pdf" style="left:22px"></div></button></div>
-    <div class="toggle-row"><span>Generate EPUB</span><button class="toggle" id="tgl-epub" onclick="toggle('epub')"><div class="knob" id="knob-epub" style="left:22px"></div></button></div>
-    <div class="toggle-row"><span>Compress Images</span><button class="toggle" id="tgl-compress" onclick="toggle('compress')"><div class="knob" id="knob-compress" style="left:22px"></div></button></div>
+    <div class="toggle-row"><span>Generate PDF</span><button class="toggle" id="tgl-pdf" onclick="doToggle('pdf')"><div class="knob" id="knob-pdf" style="left:22px"></div></button></div>
+    <div class="toggle-row"><span>Generate EPUB</span><button class="toggle" id="tgl-epub" onclick="doToggle('epub')"><div class="knob" id="knob-epub" style="left:22px"></div></button></div>
+    <div class="toggle-row"><span>Compress Images</span><button class="toggle" id="tgl-compress" onclick="doToggle('compress')"><div class="knob" id="knob-compress" style="left:22px"></div></button></div>
 
     <div class="divider"></div>
     <div class="section-label">Telegram (optional)</div>
     <label>Bot Token</label>
-    <input type="password" id="tgToken" placeholder="8284..."/>
+    <input type="password" id="tgToken" placeholder="Leave blank to skip"/>
     <label>Chat ID</label>
-    <input type="text" id="tgChatId" placeholder="7441256901"/>
+    <input type="text" id="tgChatId" placeholder="Leave blank to skip"/>
   </div>
 
-  <!-- PROGRESS -->
   <div class="card">
     <div class="panel-label">▶ Pipeline Status</div>
-    <div id="steps">
-      <!-- steps injected by JS -->
-    </div>
+    <div id="steps"></div>
     <div id="prog-wrap" style="display:none">
       <div class="progress-label">
         <span style="color:#7878a8;font-size:12px">Pages downloaded</span>
@@ -129,11 +123,9 @@ HTML = """<!DOCTYPE html>
       <div class="progress-bar-bg"><div class="progress-bar-fill" id="prog-fill" style="width:0%"></div></div>
     </div>
     <div class="log-box" id="log-box"><span style="color:#2a2a4a">// output will appear here</span></div>
-
     <button class="btn btn-primary" id="run-btn" onclick="startJob()">⚡ Run Downloader</button>
-
     <div class="downloads" id="dl-section">
-      <h3>✅ Files Ready</h3>
+      <h3>✅ Files Ready — Download Before Leaving!</h3>
       <div id="dl-links"></div>
     </div>
   </div>
@@ -143,150 +135,135 @@ HTML = """<!DOCTYPE html>
 const STEPS = ["Login","Verify Access","Download Pages","Build PDF","Build EPUB","ZIP & Export"];
 const state = {pdf:true, epub:true, compress:true};
 let currentJobId = null;
-let eventSource = null;
+let evtSrc = null;
 let stepStatuses = STEPS.map(()=>"idle");
-let stepDetails = STEPS.map(()=>"");
-let totalPages = 0;
-let donePages = 0;
+let stepDetails  = STEPS.map(()=>"");
 
-function toggle(key){
-  state[key]=!state[key];
-  const knob=document.getElementById('knob-'+key);
-  const btn=document.getElementById('tgl-'+key);
-  knob.style.left=state[key]?'22px':'3px';
-  btn.style.background=state[key]?'#6c63ff':'#1e1e38';
+function doToggle(key){
+  state[key] = !state[key];
+  document.getElementById('knob-'+key).style.left = state[key]?'22px':'3px';
+  document.getElementById('tgl-'+key).style.background = state[key]?'#6c63ff':'#1e1e38';
 }
+['pdf','epub','compress'].forEach(k => document.getElementById('tgl-'+k).style.background='#6c63ff');
 
-// init toggle colors
-['pdf','epub','compress'].forEach(k=>{
-  document.getElementById('tgl-'+k).style.background='#6c63ff';
-});
-
-const statusColor={idle:"#4a4a6a",running:"#f0a500",done:"#22c55e",error:"#ef4444",skipped:"#6b7280"};
-const statusIcon={idle:"○",running:"◌",done:"✓",error:"✗",skipped:"—"};
+const COLOR = {idle:"#4a4a6a",running:"#f0a500",done:"#22c55e",error:"#ef4444",skipped:"#6b7280"};
+const ICON  = {idle:"○",running:"◌",done:"✓",error:"✗",skipped:"—"};
 
 function renderSteps(){
-  const el=document.getElementById('steps');
-  el.innerHTML=STEPS.map((s,i)=>`
+  document.getElementById('steps').innerHTML = STEPS.map((s,i)=>`
     <div class="step-row">
-      <span class="step-icon" style="color:${statusColor[stepStatuses[i]]}">${statusIcon[stepStatuses[i]]}</span>
-      <div>
+      <span class="step-icon" style="color:${COLOR[stepStatuses[i]]}">${ICON[stepStatuses[i]]}</span>
+      <div style="flex:1;min-width:0">
         <div class="step-name" style="color:${stepStatuses[i]==='running'?'#f0a500':'#e2e2f0'}">${s}</div>
         ${stepDetails[i]?`<div class="step-detail">${stepDetails[i]}</div>`:''}
       </div>
-      <span class="step-status" style="color:${statusColor[stepStatuses[i]]}">${stepStatuses[i]}</span>
-    </div>
-  `).join('');
+      <span class="step-status" style="color:${COLOR[stepStatuses[i]]}">${stepStatuses[i]}</span>
+    </div>`).join('');
 }
 renderSteps();
 
 function addLog(msg){
-  const box=document.getElementById('log-box');
-  const line=document.createElement('div');
-  line.textContent=msg;
-  line.style.color=msg.startsWith('❌')?'#ef4444':msg.startsWith('✅')?'#22c55e':'#7878a8';
-  line.style.marginBottom='2px';
+  const box = document.getElementById('log-box');
   if(box.querySelector('span')) box.innerHTML='';
-  box.appendChild(line);
-  box.scrollTop=box.scrollHeight;
+  const d = document.createElement('div');
+  d.textContent = msg;
+  d.style.color = msg.startsWith('❌')?'#ef4444': msg.startsWith('✅')?'#22c55e':'#7878a8';
+  d.style.marginBottom = '2px';
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
 }
 
-function updateProgress(done, total){
-  if(total>0){
-    document.getElementById('prog-wrap').style.display='block';
-    document.getElementById('prog-text').textContent=`${done}/${total}`;
-    document.getElementById('prog-fill').style.width=`${Math.round(done/total*100)}%`;
-  }
+function setProgress(done, total){
+  document.getElementById('prog-wrap').style.display = 'block';
+  document.getElementById('prog-text').textContent = `${done}/${total}`;
+  document.getElementById('prog-fill').style.width = `${Math.round(done/total*100)}%`;
 }
 
 async function startJob(){
-  const email=document.getElementById('email').value.trim();
-  const password=document.getElementById('password').value.trim();
-  if(!email||!password){alert('Email and password are required.');return;}
+  const email    = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value.trim();
+  if(!email || !password){ alert('Email and password are required.'); return; }
 
-  document.getElementById('run-btn').disabled=true;
-  document.getElementById('run-btn').textContent='⏳ Running...';
-  document.getElementById('dl-section').style.display='none';
-  document.getElementById('log-box').innerHTML='';
-  stepStatuses=STEPS.map(()=>"idle");
-  stepDetails=STEPS.map(()=>"");
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('run-btn').textContent = '⏳ Running...';
+  document.getElementById('dl-section').style.display = 'none';
+  document.getElementById('log-box').innerHTML = '';
+  document.getElementById('prog-wrap').style.display = 'none';
+  stepStatuses = STEPS.map(()=>"idle");
+  stepDetails  = STEPS.map(()=>"");
   renderSteps();
 
-  const config={
+  const config = {
     email, password,
-    book_id: parseInt(document.getElementById('bookId').value),
-    start_page: parseInt(document.getElementById('startPage').value),
-    end_page: parseInt(document.getElementById('endPage').value),
+    book_id    : parseInt(document.getElementById('bookId').value),
+    start_page : parseInt(document.getElementById('startPage').value),
+    end_page   : parseInt(document.getElementById('endPage').value),
     max_workers: parseInt(document.getElementById('maxWorkers').value),
-    book_title: document.getElementById('bookTitle').value,
-    author: document.getElementById('author').value,
-    make_pdf: state.pdf,
-    make_epub: state.epub,
-    compress: state.compress,
-    tg_token: document.getElementById('tgToken').value,
-    tg_chat_id: document.getElementById('tgChatId').value,
+    book_title : document.getElementById('bookTitle').value,
+    author     : document.getElementById('author').value,
+    make_pdf   : state.pdf,
+    make_epub  : state.epub,
+    compress   : state.compress,
+    tg_token   : document.getElementById('tgToken').value.trim(),
+    tg_chat_id : document.getElementById('tgChatId').value.trim(),
   };
-  totalPages=config.end_page-config.start_page+1;
 
-  const resp=await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});
-  const data=await resp.json();
-  if(!data.job_id){addLog('❌ Failed to start job: '+(data.error||'Unknown'));resetBtn();return;}
-
-  currentJobId=data.job_id;
-  listenSSE(currentJobId);
-}
-
-function listenSSE(jobId){
-  if(eventSource) eventSource.close();
-  eventSource=new EventSource('/stream/'+jobId);
-  eventSource.onmessage=function(e){
-    const msg=JSON.parse(e.data);
-
-    if(msg.type==='log') addLog(msg.text);
-    if(msg.type==='step'){
-      stepStatuses[msg.index]=msg.status;
-      stepDetails[msg.index]=msg.detail||'';
-      renderSteps();
-    }
-    if(msg.type==='progress'){
-      updateProgress(msg.done, msg.total);
-    }
-    if(msg.type==='done'){
-      renderDoneLinks(msg.files);
-      resetBtn();
-      eventSource.close();
-    }
-    if(msg.type==='error'){
-      addLog('❌ '+msg.text);
-      resetBtn();
-      eventSource.close();
-    }
-  };
-  eventSource.onerror=function(){
-    addLog('⚠️ Connection lost.');
+  try {
+    const resp = await fetch('/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(config)
+    });
+    const data = await resp.json();
+    if(!data.job_id){ addLog('❌ '+(data.error||'Failed to start job')); resetBtn(); return; }
+    currentJobId = data.job_id;
+    connectSSE(currentJobId);
+  } catch(e){
+    addLog('❌ Network error: '+e.message);
     resetBtn();
-    eventSource.close();
+  }
+}
+
+function connectSSE(jobId){
+  if(evtSrc) evtSrc.close();
+  evtSrc = new EventSource('/stream/'+jobId);
+
+  evtSrc.onmessage = function(e){
+    let msg;
+    try { msg = JSON.parse(e.data); } catch{ return; }
+    if(msg.type === 'ping') return;
+    if(msg.type === 'log')      addLog(msg.text);
+    if(msg.type === 'step'){    stepStatuses[msg.index]=msg.status; stepDetails[msg.index]=msg.detail||''; renderSteps(); }
+    if(msg.type === 'progress') setProgress(msg.done, msg.total);
+    if(msg.type === 'done'){    showDownloads(msg.files); resetBtn(); evtSrc.close(); }
+    if(msg.type === 'error'){   addLog('❌ '+msg.text); resetBtn(); evtSrc.close(); }
+  };
+
+  evtSrc.onerror = function(){
+    addLog('⚠️ Connection lost. If the job was running, check Telegram or run again.');
+    resetBtn();
+    evtSrc.close();
   };
 }
 
-function renderDoneLinks(files){
-  const section=document.getElementById('dl-section');
-  const links=document.getElementById('dl-links');
-  section.style.display='block';
-  links.innerHTML=files.map(f=>`<a class="dl-btn" href="/download/${currentJobId}/${f.name}" download>${f.label}</a>`).join('');
+function showDownloads(files){
+  document.getElementById('dl-section').style.display = 'block';
+  document.getElementById('dl-links').innerHTML = files.map(f =>
+    `<a class="dl-btn" href="/download/${currentJobId}/${encodeURIComponent(f.name)}" download="${f.name}">${f.label}</a>`
+  ).join('');
 }
 
 function resetBtn(){
-  const btn=document.getElementById('run-btn');
-  btn.disabled=false;
-  btn.textContent='⚡ Run Downloader';
+  const btn = document.getElementById('run-btn');
+  btn.disabled = false;
+  btn.textContent = '⚡ Run Downloader';
 }
 </script>
 </body>
 </html>"""
 
 
-# ─── ROUTES ─────────────────────────────────────────────────────────────────
+# ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -295,20 +272,21 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start_job():
-    config = request.get_json()
+    config = request.get_json(force=True, silent=True)
+    if not config:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    for field in ["email", "password", "book_id", "start_page", "end_page"]:
+        if field not in config:
+            return jsonify({"error": f"Missing field: {field}"}), 400
+
     job_id = str(uuid.uuid4())
-    log_q = queue.Queue()
+    log_q  = queue.Queue()
 
     with jobs_lock:
-        jobs[job_id] = {
-            "status": "running",
-            "log_queue": log_q,
-            "files": [],
-            "config": config,
-        }
+        jobs[job_id] = {"status": "running", "log_queue": log_q, "files": [], "config": config}
 
-    thread = threading.Thread(target=run_job, args=(job_id, config, log_q), daemon=True)
-    thread.start()
+    threading.Thread(target=run_job, args=(job_id, config, log_q), daemon=True).start()
     return jsonify({"job_id": job_id})
 
 
@@ -319,151 +297,144 @@ def stream(job_id):
     if not job:
         return jsonify({"error": "Job not found"}), 404
 
+    q = job["log_queue"]
+
     def generate():
-        q = job["log_queue"]
         while True:
             try:
-                msg = q.get(timeout=30)
+                msg = q.get(timeout=25)
                 yield f"data: {json.dumps(msg)}\n\n"
                 if msg.get("type") in ("done", "error"):
                     break
             except queue.Empty:
                 yield f"data: {json.dumps({'type':'ping'})}\n\n"
 
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.route("/download/<job_id>/<filename>")
 def download_file(job_id, filename):
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
-        return "Job not found", 404
-    job_dir = os.path.join(WORK_DIR, job_id)
-    filepath = os.path.join(job_dir, filename)
+    filename = os.path.basename(filename)          # prevent path traversal
+    if not job_id or ".." in job_id:
+        return "Bad request", 400
+    filepath = os.path.join(WORK_DIR, job_id, filename)
     if not os.path.exists(filepath):
-        return "File not found", 404
-    return send_file(filepath, as_attachment=True)
+        return "File not found. Files are deleted on server restart — run the job again.", 404
+    return send_file(filepath, as_attachment=True, download_name=filename)
 
 
-# ─── JOB RUNNER ─────────────────────────────────────────────────────────────
+# ─── JOB RUNNER ──────────────────────────────────────────────────────────────
 
 def run_job(job_id, config, q):
-    def send(msg):
-        q.put(msg)
+    def send(msg):   q.put(msg)
+    def log(text):   send({"type": "log", "text": text})
+    def step(i, s, d=""): send({"type": "step", "index": i, "status": s, "detail": d})
 
-    def log(text):
-        send({"type": "log", "text": text})
-
-    def step(index, status, detail=""):
-        send({"type": "step", "index": index, "status": status, "detail": detail})
-
-    job_dir = os.path.join(WORK_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    pages_dir = os.path.join(job_dir, "pages")
+    pages_dir = os.path.join(WORK_DIR, job_id, "pages")
+    job_dir   = os.path.join(WORK_DIR, job_id)
     os.makedirs(pages_dir, exist_ok=True)
 
     try:
-        # Step 0: Login
+        # Step 0 — Login
         step(0, "running", f"Logging in as {config['email']}...")
         log("🔐 Logging in to yctpublication.com...")
-        session_cookie = downloader.login(config["email"], config["password"])
-        step(0, "done", f"Logged in as {config['email']}")
+        cookie = downloader.login(config["email"], config["password"])
+        step(0, "done", f"Logged in")
         log("✅ Login successful!")
 
-        # Step 1: Verify
-        step(1, "running", f"Checking Book {config['book_id']} access...")
-        log(f"🔍 Verifying access to Book {config['book_id']}...")
-        downloader.verify_access(session_cookie, config["book_id"])
-        step(1, "done", f"Book {config['book_id']} accessible")
+        # Step 1 — Verify
+        step(1, "running", f"Checking Book {config['book_id']}...")
+        log(f"🔍 Verifying Book {config['book_id']}...")
+        downloader.verify_access(cookie, config["book_id"])
+        step(1, "done", "Accessible")
         log("✅ Access confirmed!")
 
-        # Step 2: Download
+        # Step 2 — Download
         total = config["end_page"] - config["start_page"] + 1
         step(2, "running", f"Downloading {total} pages...")
-        log(f"📖 Starting download: pages {config['start_page']}–{config['end_page']}")
+        log(f"📖 Pages {config['start_page']}–{config['end_page']}")
+        done_count = [0]
 
-        ok_count = [0]
-
-        def log_with_progress(text):
+        def plog(text):
             log(text)
-            if text.startswith("✅ Page"):
-                ok_count[0] += 1
-                send({"type": "progress", "done": ok_count[0], "total": total})
+            if "downloaded" in text or "skipped" in text:
+                done_count[0] += 1
+                send({"type": "progress", "done": done_count[0], "total": total})
 
         ok, skipped, failed = downloader.download_pages(
-            session_cookie, config["book_id"],
+            cookie, config["book_id"],
             config["start_page"], config["end_page"],
-            config["max_workers"], pages_dir, log_with_progress
+            config["max_workers"], pages_dir, plog,
         )
-        step(2, "done", f"{ok} downloaded, {len(failed)} failed")
-        log(f"📊 Download done! ✅ {ok} | ⏭️ {skipped} | ❌ {len(failed)}")
+        step(2, "done", f"{ok} ok · {len(failed)} failed")
+        log(f"📊 ✅ {ok} | ⏭️ {skipped} | ❌ {len(failed)}")
 
-        generated_files = []
+        generated = []
 
-        # Step 3: PDF
+        # Step 3 — PDF
         if config.get("make_pdf"):
             step(3, "running", "Building PDF...")
             log("📄 Creating PDF...")
-            pdf_name = f"yct_{config['book_id']}_{config['start_page']}_{config['end_page']}.pdf"
-            pdf_path = os.path.join(job_dir, pdf_name)
-            downloader.make_pdf(pages_dir, pdf_path, config.get("compress", True), log)
-            generated_files.append({"name": pdf_name, "label": f"📄 Download PDF"})
-            step(3, "done", f"PDF ready")
+            name = f"yct_{config['book_id']}_{config['start_page']}_{config['end_page']}.pdf"
+            mb   = downloader.make_pdf(pages_dir, os.path.join(job_dir, name), config.get("compress", True), log)
+            generated.append({"name": name, "label": f"📄 PDF ({mb:.1f} MB)"})
+            step(3, "done", f"{mb:.1f} MB")
         else:
             step(3, "skipped")
 
-        # Step 4: EPUB
+        # Step 4 — EPUB
         if config.get("make_epub"):
             step(4, "running", "Building EPUB...")
             log("📚 Creating EPUB...")
-            epub_name = f"yct_{config['book_id']}_{config['start_page']}_{config['end_page']}.epub"
-            epub_path = os.path.join(job_dir, epub_name)
-            downloader.make_epub(
-                pages_dir, epub_path, config["book_id"],
-                config["start_page"], config["book_title"],
-                config["author"], config.get("compress", True), log
+            name = f"yct_{config['book_id']}_{config['start_page']}_{config['end_page']}.epub"
+            mb   = downloader.make_epub(
+                pages_dir, os.path.join(job_dir, name),
+                config["book_id"], config["start_page"],
+                config["book_title"], config["author"],
+                config.get("compress", True), log,
             )
-            generated_files.append({"name": epub_name, "label": f"📚 Download EPUB"})
-            step(4, "done", f"EPUB ready")
+            generated.append({"name": name, "label": f"📚 EPUB ({mb:.1f} MB)"})
+            step(4, "done", f"{mb:.1f} MB")
         else:
             step(4, "skipped")
 
-        # Step 5: ZIP
-        step(5, "running", "Creating ZIP...")
-        log("📦 Zipping pages...")
-        zip_name = f"yct_{config['book_id']}_{config['start_page']}_{config['end_page']}_pages.zip"
-        zip_path = os.path.join(job_dir, zip_name)
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for fname in os.listdir(pages_dir):
+        # Step 5 — ZIP
+        step(5, "running", "Zipping pages...")
+        log("📦 Creating ZIP...")
+        name = f"yct_{config['book_id']}_{config['start_page']}_{config['end_page']}_pages.zip"
+        with zipfile.ZipFile(os.path.join(job_dir, name), "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname in sorted(os.listdir(pages_dir)):
                 zf.write(os.path.join(pages_dir, fname), fname)
-        zip_mb = os.path.getsize(zip_path) / (1024 * 1024)
-        generated_files.append({"name": zip_name, "label": f"📦 Download ZIP ({zip_mb:.1f} MB)"})
-        step(5, "done", f"ZIP ready — {zip_mb:.1f} MB")
-        log(f"✅ ZIP ready! {zip_mb:.1f} MB")
+        mb = os.path.getsize(os.path.join(job_dir, name)) / (1024 * 1024)
+        generated.append({"name": name, "label": f"📦 ZIP ({mb:.1f} MB)"})
+        step(5, "done", f"{mb:.1f} MB")
+        log(f"✅ ZIP: {mb:.1f} MB")
 
         # Telegram
-        if config.get("tg_token") and config.get("tg_chat_id"):
-            for f in generated_files:
-                fpath = os.path.join(job_dir, f["name"])
+        tg_token   = config.get("tg_token", "").strip()
+        tg_chat_id = config.get("tg_chat_id", "").strip()
+        if tg_token and tg_chat_id:
+            for f in generated:
                 downloader.send_to_telegram(
-                    fpath,
-                    f"<b>{config['book_title']}</b> | {f['label']}",
-                    config["tg_token"], config["tg_chat_id"], log
+                    os.path.join(job_dir, f["name"]),
+                    f"<b>{config.get('book_title','YCT')}</b> | {f['label']}",
+                    tg_token, tg_chat_id, log,
                 )
 
         log("🎉 All done!")
         with jobs_lock:
             jobs[job_id]["status"] = "done"
-            jobs[job_id]["files"] = generated_files
-        send({"type": "done", "files": generated_files})
+            jobs[job_id]["files"]  = generated
+        send({"type": "done", "files": generated})
 
     except Exception as e:
-        log(f"❌ Error: {e}")
-        step_indices = [0, 1, 2, 3, 4, 5]
-        for i in step_indices:
-            pass  # don't mass-error all steps
+        import traceback
+        print(f"[JOB {job_id}] TRACEBACK:\n{traceback.format_exc()}")
+        log(f"❌ {e}")
         with jobs_lock:
             jobs[job_id]["status"] = "error"
         send({"type": "error", "text": str(e)})
